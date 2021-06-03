@@ -113,6 +113,8 @@ struct VkSwapchainKHR_T
 {
     VkSwapchainKHR swapchain; /* native swapchain */
 
+    BOOL retired;
+
     /* fs hack data below */
     BOOL fs_hack_enabled;
     VkExtent2D user_extent;

@@ -2602,7 +2602,7 @@ VkResult WINAPI wine_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCrea
 #endif
     VkResult result;
     VkExtent2D user_sz;
-    struct VkSwapchainKHR_T *object;
+    struct VkSwapchainKHR_T *object, *old;
 
     TRACE("%p, %p, %p, %p\n", device, create_info, allocator, swapchain);
 
@@ -2615,10 +2615,19 @@ VkResult WINAPI wine_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCrea
     convert_VkSwapchainCreateInfoKHR_win_to_host(create_info, &native_info);
 
     if(native_info.oldSwapchain)
-        native_info.oldSwapchain = ((struct VkSwapchainKHR_T *)(UINT_PTR)native_info.oldSwapchain)->swapchain;
+    {
+        //native_info.oldSwapchain = ((struct VkSwapchainKHR_T *)(UINT_PTR)native_info.oldSwapchain)->swapchain;
+        FIXME("oldSwapchain faked\n");
+        old = (struct VkSwapchainKHR_T *)(UINT_PTR)native_info.oldSwapchain;
+        native_info.oldSwapchain = VK_NULL_HANDLE;
+        old->retired = TRUE;
+        device->funcs.p_vkDeviceWaitIdle(device->device);
+        device->funcs.p_vkDestroySwapchainKHR(device->device, old->swapchain, NULL);
+    }
 
+    // force fshack because images have to stay alive
     if(vk_funcs->query_fs_hack &&
-            vk_funcs->query_fs_hack(native_info.surface, &object->real_extent, &user_sz, &object->blit_dst, &object->fs_hack_filter) &&
+            (vk_funcs->query_fs_hack(native_info.surface, &object->real_extent, &user_sz, &object->blit_dst, &object->fs_hack_filter) || TRUE) &&
             native_info.imageExtent.width == user_sz.width &&
             native_info.imageExtent.height == user_sz.height)
     {
@@ -3177,7 +3186,8 @@ void WINAPI wine_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain
         heap_free(object->fs_hack_images);
     }
 
-    device->funcs.p_vkDestroySwapchainKHR(device->device, object->swapchain, NULL);
+    if (!object->retired)
+        device->funcs.p_vkDestroySwapchainKHR(device->device, object->swapchain, NULL);
 
     WINE_VK_REMOVE_HANDLE_MAPPING(device->phys_dev->instance, object);
     heap_free(object);
@@ -3647,10 +3657,49 @@ VkResult WINAPI wine_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pP
     struct VkSwapchainKHR_T *swapchain;
     uint32_t i, n_hacks = 0;
     uint32_t queue_idx;
+    VkFenceCreateInfo fence_info;
+    VkFence fence;
 
     TRACE("%p, %p\n", queue, pPresentInfo);
 
     our_presentInfo = *pPresentInfo;
+
+    if (our_presentInfo.swapchainCount > 1)
+        FIXME("retired swapchain present only handled for one swapchain");
+
+    swapchain = (struct VkSwapchainKHR_T *)(UINT_PTR)our_presentInfo.pSwapchains[0];
+    if (swapchain->retired)
+    {
+        VkPipelineStageFlags *waitStages;
+
+        waitStages = heap_alloc(sizeof(VkPipelineStageFlags) * pPresentInfo->waitSemaphoreCount);
+        for(i = 0; i < pPresentInfo->waitSemaphoreCount; ++i)
+            waitStages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+        fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fence_info.pNext = NULL;
+        fence_info.flags = 0;
+
+        queue->device->funcs.p_vkCreateFence(queue->device->device, &fence_info, NULL, &fence);
+
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+        submitInfo.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+
+        queue->device->funcs.p_vkQueueSubmit(queue->queue, 1, &submitInfo, fence);
+
+        queue->device->funcs.p_vkWaitForFences(queue->device->device, 1, &fence, VK_TRUE, ~0ull);
+        queue->device->funcs.p_vkDestroyFence(queue->device->device, fence, NULL);
+
+        if (pPresentInfo->pResults)
+            *pPresentInfo->pResults = VK_ERROR_OUT_OF_DATE_KHR;
+
+        heap_free(waitStages);
+
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
 
     for(i = 0; i < our_presentInfo.swapchainCount; ++i){
         swapchain = (struct VkSwapchainKHR_T *)(UINT_PTR)our_presentInfo.pSwapchains[i];
